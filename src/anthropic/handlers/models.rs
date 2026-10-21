@@ -819,7 +819,15 @@ mod alias_tests {
         let out = normalize_model_ids(input);
         let uniq: std::collections::HashSet<&str> = ids(&out).into_iter().collect();
         assert_eq!(uniq.len(), out.len(), "出口存在重复 ID");
-        assert_eq!(ids(&out), ["claude-opus-5-5", "claude-opus-4-8", "claude-opus-5", "auto"]);
+        assert_eq!(
+            ids(&out),
+            [
+                "claude-opus-5-5",
+                "claude-opus-4-8",
+                "claude-opus-5",
+                "auto"
+            ]
+        );
     }
 
     /// 静态表经过出口归一化后同样不应出现重复
@@ -872,6 +880,9 @@ mod alias_tests {
             m("gpt-5.6-sol"),
         ]);
         let out = normalize_model_ids(aliased);
-        assert_eq!(ids(&out), ["claude-opus-4-5", "claude-opus-5-5", "gpt-5.6-sol"]);
+        assert_eq!(
+            ids(&out),
+            ["claude-opus-4-5", "claude-opus-5-5", "gpt-5.6-sol"]
+        );
     }
 }
