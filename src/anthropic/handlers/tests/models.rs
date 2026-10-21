@@ -5,7 +5,8 @@ mod tests {
 
     use super::super::super::models::{
         ModelCache, available_model_to_model, build_model_list, cached_if_fresh,
-        fetch_models_dynamic, get_model, guess_owned_by, normalize_model_ids, resolve_after_refresh,
+        fetch_models_dynamic, get_model, guess_owned_by, normalize_model_ids,
+        resolve_after_refresh,
     };
 
     use crate::anthropic::middleware::AppState;
