@@ -27,7 +27,15 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
 pub(crate) type ModelCache =
     std::sync::Arc<parking_lot::RwLock<Option<super::super::middleware::CachedModels>>>;
 
-/// 动态获取模型列表：优先上游实时响应（带 TTL 缓存），失败按顺序回退。
+/// 动态获取模型列表（对外唯一出口）：原始结果经 `normalize_model_ids` 归一化后返回。
+///
+/// `/v1/models` 与 `/v1/models/:model_id` 都经由本函数取数，因此归一化在此处统一生效，
+/// 保证两个出口暴露的 ID 集合完全一致（点号 ID 不会在单模型查询里漏出）。
+pub(crate) async fn fetch_models_dynamic(state: &AppState) -> Vec<Model> {
+    normalize_model_ids(fetch_models_dynamic_raw(state).await)
+}
+
+/// 原始动态获取逻辑：优先上游实时响应（带 TTL 缓存），失败按顺序回退。
 ///
 /// 分支：
 /// 1. 缓存存在且未过期 → 直接返回缓存，不打上游
@@ -35,7 +43,10 @@ pub(crate) type ModelCache =
 /// 3. 上游失败但存在旧缓存 → 续用旧缓存（warn）
 /// 4. 上游失败且无缓存 → 回退静态表 `build_model_list()`（warn）
 /// 5. 未配置 `kiro_provider` → 直接回退静态表（无上游可查）
-pub(crate) async fn fetch_models_dynamic(state: &AppState) -> Vec<Model> {
+///
+/// 返回值保持上游原始 ID 写法（含点号），归一化由调用方 `fetch_models_dynamic` 负责，
+/// 缓存里存的也是原始形态。
+async fn fetch_models_dynamic_raw(state: &AppState) -> Vec<Model> {
     // 分支 5：无上游 provider，直接静态表
     let Some(provider) = state.kiro_provider.as_ref() else {
         return build_model_list();
@@ -131,6 +142,75 @@ pub(crate) fn cached_if_fresh(cache: &ModelCache, ttl: Duration) -> Option<Vec<M
         .as_ref()
         .filter(|cached| cached.fetched_at.elapsed() < ttl)
         .map(|cached| cached.models.clone())
+}
+
+/// 出口归一化：Claude 系模型 ID 统一为连字符（官方）写法，并去除同一模型的重复条目。
+///
+/// Kiro `ListAvailableModels` 返回 `claude-opus-5.5` 这类点号 ID，开启
+/// `modelsOfficialAliases` 后会追加官方连字符别名 `claude-opus-5-5`，导致同一个模型
+/// 在 `/v1/models` 里出现两条，客户端模型选择器出现重复项。
+///
+/// 处理分两步：
+/// 1. 把 `claude-` 开头且含 `.` 的 ID 改写为连字符写法（`claude-opus-5.5` →
+///    `claude-opus-5-5`），并按规范化后的 ID 去重，保留首次出现的条目
+/// 2. 若同时存在 `claude-opus-4-5` 与带日期的 `claude-opus-4-5-20251101`，丢弃带日期
+///    的那条，只保留不带日期的 ID（用户侧选择器与下游网关都用短 ID 更稳定）
+///
+/// 边界：
+/// - 非 Claude 模型（`gpt-5.6-sol` / `deepseek-3.2` / `minimax-m2.5` 等）的点号是
+///   模型名的一部分，原样保留
+/// - 只有带日期 ID 而没有对应短 ID 的条目（如静态表里的 `claude-3-5-sonnet-20241022`）
+///   原样保留，避免删掉唯一可用条目
+/// - `map_model` 对点号与连字符两种写法映射一致，收敛后客户端请求任一保留 ID
+///   都命中同一个 Kiro 模型
+pub(crate) fn normalize_model_ids(models: Vec<Model>) -> Vec<Model> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<Model> = Vec::with_capacity(models.len());
+    for model in models {
+        let id = canonical_model_id(&model.id);
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        out.push(Model { id, ..model });
+    }
+    drop_dated_when_short_exists(out)
+}
+
+/// 单个模型 ID 的规范形式：`claude-` 开头且含 `.` 时把点替换为连字符，其余原样返回。
+pub(crate) fn canonical_model_id(id: &str) -> String {
+    if id.starts_with("claude-") && id.contains('.') {
+        id.replace('.', "-")
+    } else {
+        id.to_string()
+    }
+}
+
+/// 丢弃"存在对应短 ID"的带日期条目（纯逻辑）。
+///
+/// 仅处理 `claude-` 开头且以 `-YYYYMMDD` 结尾的 ID；短 ID 必须在同一份列表里真实存在
+/// 才会丢弃，因此不会误删只有带日期写法的条目。
+pub(crate) fn drop_dated_when_short_exists(models: Vec<Model>) -> Vec<Model> {
+    let ids: std::collections::HashSet<String> = models.iter().map(|m| m.id.clone()).collect();
+    models
+        .into_iter()
+        .filter(|m| match dated_suffix_start(&m.id) {
+            Some(short) => !ids.contains(short),
+            None => true,
+        })
+        .collect()
+}
+
+/// 若 `id` 是 `claude-*-YYYYMMDD` 形式，返回去掉日期后的短 ID；否则返回 `None`。
+fn dated_suffix_start(id: &str) -> Option<&str> {
+    if !id.starts_with("claude-") {
+        return None;
+    }
+    let (short, date) = id.rsplit_once('-')?;
+    if date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) && short.starts_with("claude-") {
+        Some(short)
+    } else {
+        None
+    }
 }
 
 /// 刷新结果落地（纯逻辑，无网络）：
@@ -673,5 +753,136 @@ mod alias_tests {
             );
         }
         assert_eq!(out.len(), upstream.len() * 2 + 3);
+    }
+
+    // ==== 出口归一化（normalize_model_ids / canonical_model_id）====
+
+    /// 核心诉求：点号 ID 与连字符 ID 同时存在时，出口只保留连字符那条
+    #[test]
+    fn normalize_drops_dotted_keeps_hyphen() {
+        let out = normalize_model_ids(vec![m("claude-opus-5.5"), m("claude-opus-5-5")]);
+        assert_eq!(ids(&out), ["claude-opus-5-5"]);
+    }
+
+    /// 只有点号 ID（未开别名开关）时，出口把它改写成连字符写法
+    #[test]
+    fn normalize_rewrites_lone_dotted_id() {
+        let out = normalize_model_ids(vec![m("claude-opus-4.6"), m("auto")]);
+        assert_eq!(ids(&out), ["claude-opus-4-6", "auto"]);
+        assert_eq!(out[0].max_tokens, 128000, "改写 ID 不应丢字段");
+    }
+
+    /// 4.5 代际：短 ID 与带日期 ID 并存时，只保留不带日期的短 ID
+    #[test]
+    fn normalize_prefers_short_id_over_dated() {
+        let out = normalize_model_ids(vec![
+            m("claude-haiku-4.5"),
+            m("claude-haiku-4-5"),
+            m("claude-haiku-4-5-20251001"),
+        ]);
+        assert_eq!(ids(&out), ["claude-haiku-4-5"]);
+    }
+
+    /// 只有带日期 ID 时不能删（否则该模型彻底消失）
+    #[test]
+    fn normalize_keeps_dated_id_when_short_absent() {
+        let out = normalize_model_ids(vec![m("claude-opus-4-5-20251101")]);
+        assert_eq!(ids(&out), ["claude-opus-4-5-20251101"]);
+    }
+
+    /// 非 Claude 模型点号属于名字本身，一律不动
+    #[test]
+    fn normalize_leaves_non_claude_dots() {
+        let out = normalize_model_ids(vec![
+            m("gpt-5.6-sol"),
+            m("deepseek-3.2"),
+            m("minimax-m2.5"),
+            m("glm-5"),
+        ]);
+        assert_eq!(
+            ids(&out),
+            ["gpt-5.6-sol", "deepseek-3.2", "minimax-m2.5", "glm-5"]
+        );
+    }
+
+    /// 去重后不能残留任何重复 ID
+    #[test]
+    fn normalize_output_has_no_duplicate_ids() {
+        let input = vec![
+            m("claude-opus-5.5"),
+            m("claude-opus-5-5"),
+            m("claude-opus-4.8"),
+            m("claude-opus-4-8"),
+            m("claude-opus-5"),
+            m("auto"),
+        ];
+        let out = normalize_model_ids(input);
+        let uniq: std::collections::HashSet<&str> = ids(&out).into_iter().collect();
+        assert_eq!(uniq.len(), out.len(), "出口存在重复 ID");
+        assert_eq!(
+            ids(&out),
+            [
+                "claude-opus-5-5",
+                "claude-opus-4-8",
+                "claude-opus-5",
+                "auto"
+            ]
+        );
+    }
+
+    /// 静态表经过出口归一化后同样不应出现重复
+    #[test]
+    fn normalize_static_list_has_no_duplicates() {
+        let out = normalize_model_ids(build_model_list());
+        let uniq: std::collections::HashSet<&str> = ids(&out).into_iter().collect();
+        assert_eq!(uniq.len(), out.len(), "静态表出口存在重复 ID");
+        // 静态表里的带日期条目没有对应短 ID 时必须保留
+        assert!(ids(&out).contains(&"claude-opus-4-5-20251101"));
+        assert!(ids(&out).contains(&"claude-sonnet-4-5-20250929"));
+        assert!(ids(&out).contains(&"claude-haiku-4-5-20251001"));
+    }
+
+    /// 归一化前后 map_model 结果一致（否则收敛会改变请求落点）
+    #[test]
+    fn normalize_preserves_map_model_target() {
+        for id in [
+            "claude-opus-5.5",
+            "claude-sonnet-5.5",
+            "claude-opus-4.8",
+            "claude-opus-4.7",
+            "claude-opus-4.6",
+            "claude-sonnet-4.6",
+        ] {
+            let canonical = canonical_model_id(id);
+            assert_eq!(
+                crate::anthropic::converter::map_model(id),
+                crate::anthropic::converter::map_model(&canonical),
+                "{id} 与 {canonical} 映射不一致"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_model_id_cases() {
+        assert_eq!(canonical_model_id("claude-opus-5.5"), "claude-opus-5-5");
+        assert_eq!(canonical_model_id("claude-opus-5-5"), "claude-opus-5-5");
+        assert_eq!(canonical_model_id("gpt-5.6-sol"), "gpt-5.6-sol");
+        assert_eq!(canonical_model_id("deepseek-3.2"), "deepseek-3.2");
+        assert_eq!(canonical_model_id("auto"), "auto");
+    }
+
+    /// 端到端：开启别名后（点号 + 连字符 + 带日期三份）出口只留一条
+    #[test]
+    fn aliases_then_normalize_yields_single_entry() {
+        let aliased = with_official_aliases(vec![
+            m("claude-opus-4.5"),
+            m("claude-opus-5.5"),
+            m("gpt-5.6-sol"),
+        ]);
+        let out = normalize_model_ids(aliased);
+        assert_eq!(
+            ids(&out),
+            ["claude-opus-4-5", "claude-opus-5-5", "gpt-5.6-sol"]
+        );
     }
 }
