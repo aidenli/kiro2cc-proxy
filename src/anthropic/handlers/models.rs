@@ -190,7 +190,7 @@ pub(crate) fn canonical_model_id(id: &str) -> String {
 /// 仅处理 `claude-` 开头且以 `-YYYYMMDD` 结尾的 ID；短 ID 必须在同一份列表里真实存在
 /// 才会丢弃，因此不会误删只有带日期写法的条目。
 pub(crate) fn drop_dated_when_short_exists(models: Vec<Model>) -> Vec<Model> {
-    let ids: std::collections::HashSet<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    let ids: std::collections::HashSet<String> = models.iter().map(|m| m.id.clone()).collect();
     models
         .into_iter()
         .filter(|m| match dated_suffix_start(&m.id) {
