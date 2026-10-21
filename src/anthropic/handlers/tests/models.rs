@@ -5,7 +5,7 @@ mod tests {
 
     use super::super::super::models::{
         ModelCache, available_model_to_model, build_model_list, cached_if_fresh,
-        fetch_models_dynamic, get_model, guess_owned_by, resolve_after_refresh,
+        fetch_models_dynamic, get_model, guess_owned_by, normalize_model_ids, resolve_after_refresh,
     };
 
     use crate::anthropic::middleware::AppState;
@@ -106,12 +106,34 @@ mod tests {
     }
 
     // 分支 5：无 provider → fetch_models_dynamic 直接回退静态表
+    // 注意：fetch_models_dynamic 是出口，会对静态表做归一化（点号→连字符、去掉重复），
+    // 因此长度等于归一化后的长度，而非原始静态表长度
     #[tokio::test]
     async fn test_fetch_models_dynamic_no_provider_static() {
         let state = AppState::new();
         assert!(state.kiro_provider.is_none());
         let out = fetch_models_dynamic(&state).await;
-        assert_eq!(out.len(), build_model_list().len());
+        assert_eq!(out.len(), normalize_model_ids(build_model_list()).len());
+        // 出口不得出现重复 ID
+        let uniq: std::collections::HashSet<&str> = out.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(uniq.len(), out.len(), "出口存在重复 ID");
+    }
+
+    // 出口归一化：静态表里同时存在 claude-sonnet-4 与 claude-sonnet-4-20250514，
+    // 收敛为不带日期的短 ID 一条
+    #[tokio::test]
+    async fn test_fetch_models_dynamic_collapses_dated_static_entry() {
+        let state = AppState::new();
+        let out = fetch_models_dynamic(&state).await;
+        let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"claude-sonnet-4"));
+        assert!(
+            !ids.contains(&"claude-sonnet-4-20250514"),
+            "存在短 ID 时带日期条目应被收敛"
+        );
+        // 没有对应短 ID 的带日期条目必须保留
+        assert!(ids.contains(&"claude-opus-4-20250514"));
+        assert!(ids.contains(&"claude-opus-4-5-20251101"));
     }
 
     fn test_state() -> AppState {
